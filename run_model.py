@@ -586,10 +586,10 @@ def infernce(engine, version_model, prediction_table_name, final_df):
 
 def infernce_kpis(engine, final_df, anaf_df):
     start = time.time()
-    print(f'level 1 {accuracy_score(final_df.mst_anaf_lvl1.values, final_df.mst_anaf_lvl1_best.values):.2f}')
-    print(f'level 2 {accuracy_score(final_df.mst_anaf_lvl2.values, final_df.mst_anaf_lvl2_best.values):.2f}')
-    print(f'level 3 {accuracy_score(final_df.mst_anaf_lvl3.values, final_df.mst_anaf_lvl3_best.values):.2f}')
-    print(f'level 4 {accuracy_score(final_df[label].values, final_df.best_anaf.values):.2f}')
+    print(f' level 1 {accuracy_score(final_df.mst_anaf_lvl1.values, final_df.mst_anaf_lvl1_best.values):.2f}')
+    print(f' level 2 {accuracy_score(final_df.mst_anaf_lvl2.values, final_df.mst_anaf_lvl2_best.values):.2f}')
+    print(f' level 3 {accuracy_score(final_df.mst_anaf_lvl3.values, final_df.mst_anaf_lvl3_best.values):.2f}')
+    print(f' level 4 {accuracy_score(final_df[label].values, final_df.best_anaf.values):.2f}')
 
     kpis_results = metrics_kpis(final_df[label].values.reshape(-1, 1), final_df.best_anaf.values.reshape(-1, 1))
 
