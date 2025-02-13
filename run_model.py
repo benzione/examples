@@ -515,7 +515,7 @@ def infernce_final_df(df_k_fold_results, le, remove_cols):
     start = time.time()
     list_dfs = []
     for fold in range(folds_size):
-        print(f'fold {fold}')
+        print(f' fold {fold}')
         prob = df_k_fold_results['model'][fold].predict_proba(df_k_fold_results['x_test'][fold])
         current_prob = pd.Series(prob[np.arange(prob.shape[0]),
                             [a[0] for a in df_k_fold_results['y_test'][fold].values.tolist()]])
@@ -581,10 +581,10 @@ def infernce(engine, version_model, prediction_table_name, final_df):
                     index=False)
     end = time.time()
     print_time(' infernce predictions', end - start)
-    return final_df
+    return final_df, anaf_df
 
 
-def infernce_kpis(engine, final_df):
+def infernce_kpis(engine, final_df, anaf_df):
     start = time.time()
     print(f'level 1 {accuracy_score(final_df.mst_anaf_lvl1.values, final_df.mst_anaf_lvl1_best.values):.2f}')
     print(f'level 2 {accuracy_score(final_df.mst_anaf_lvl2.values, final_df.mst_anaf_lvl2_best.values):.2f}')
@@ -630,8 +630,8 @@ def main():
         importance_features(lv4_df_k_fold_results, engine, version_model)
     print('run inference')
     final_df = infernce_final_df(lv4_df_k_fold_results, le, remove_cols)
-    final_df = infernce(engine, version_model, prediction_table_name, final_df)
-    infernce_kpis(engine, final_df)
+    final_df, anaf_df = infernce(engine, version_model, prediction_table_name, final_df)
+    infernce_kpis(engine, final_df, anaf_df)
 
 
 if __name__ == '__main__':
