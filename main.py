@@ -1,25 +1,23 @@
 import os
-
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-
-from logger import logger
-
+import numpy as np
+import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, models
-import pandas as pd
-import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from tensorflow.keras.callbacks import ModelCheckpoint
-from sqlalchemy import create_engine, text
 import joblib
+from datetime import datetime
 
-# Define checkpoint callback
+# Set TensorFlow options
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+# Define checkpoint callbacks
 checkpoint_callback = ModelCheckpoint(
     filepath="model_checkpoint.keras",
-    save_weights_only=False,  # Save full model (architecture + weights)
-    save_freq="epoch",  # Save every epoch
+    save_weights_only=False,
+    save_freq="epoch",
     verbose=1,
 )
 
@@ -31,103 +29,49 @@ checkpoint_best_callback = ModelCheckpoint(
     verbose=1,
 )
 
-
-def remove_irrelevant_cols(df):
-    df = df.drop(df.filter(like="T_IDCUN", axis=1).columns, axis=1)
-    df = df.drop(df.filter(like="ANAF", axis=1).columns, axis=1)
-    df = df.drop(df.filter(like="MIKUD", axis=1).columns, axis=1)
-
-    drop_cols = [
-        "DIRA",
-        "MS_FAX",
-        "DIRA_ESEK",
-        "MISPAR_YESHUT",
-        "TEL_ESEK",
-        "MS_TELFON",
-        "DATE_TIK",
-    ]
-
-    return df.drop(drop_cols, axis=1)
-
-
-def remove_null_cols(df):
-    df_cleaned = df.dropna(axis=1, how="all")
-    return df_cleaned
-
-
-def remove_single_value_cols(df):
-    return df.loc[:, df.nunique() != 1]
-
-
-def make_oneot(df):
-    onehot_hardcoded = ["YSHUV"]
-
-    onehot_from_data = [col for col in df.columns if col.endswith("_onehot")]
-
-    onehot_columns = onehot_from_data + onehot_hardcoded
-    df_encoded = pd.get_dummies(df, columns=onehot_columns, prefix_sep="_")
-
-    return df_encoded
-
-
-def remove_correlated_features(df, threshold=0.9):
-    df = df.apply(pd.to_numeric, errors="coerce")  # Converts non-numeric values to NaN
-    df = df.dropna(axis=1, how="all")  # Drop columns that are entirely NaN
-
-    correlation_matrix = df.corr().abs()
-    upper_tri = correlation_matrix.where(
-        np.triu(np.ones(correlation_matrix.shape), k=1).astype(bool)
-    )
-    correlated_features = [
-        column for column in upper_tri.columns if any(upper_tri[column] > threshold)
-    ]
-    return df.drop(columns=correlated_features)
-
-
-def append_y(df):
-    df_excel = pd.read_excel("Book1.xlsx")
-    df = df.merge(df_excel[["TIK", "category"]], on="TIK", how="left")
-    return df.dropna(subset=["category"])
-
-
-def another_model(input_dim, num_classes):
-    # Define the model
-    inputs = layers.Input(shape=(input_dim,))
-
-    # Embedding layer (if features are categorical)
-    embedded = layers.Embedding(input_dim=1000, output_dim=64)(inputs)
-
-    # Transformer Block
-    x = layers.MultiHeadAttention(num_heads=8, key_dim=64)(embedded, embedded)
-    x = layers.Dropout(0.3)(x)
-    x = layers.LayerNormalization()(x)
-
-    # Combine with dense layers
-    x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dense(512, activation="relu")(x)
-    x = layers.Dropout(0.4)(x)
-
-    # Output layer for multi-class classification
-    outputs = layers.Dense(num_classes, activation="softmax")(x)
-
-    # Create the model
-    model = models.Model(inputs, outputs)
-
-    # Compile the model
-    model.compile(
-        optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"]
-    )
-
-    # Summary of the model architecture
-    model.summary()
-
-    return model
-
+def preprocess_dataset(df):
+    """
+    Preprocess the synthetic dataset:
+    - Handle numeric features
+    - Transform date features into numeric representations
+    - One-hot encode categorical features
+    - Use the existing category column as the target
+    """
+    print(f"Original dataset shape: {df.shape}")
+    
+    # Identify feature types by column names
+    numeric_cols = [col for col in df.columns if col.startswith('feature_') and not ('_date' in col or '_cat' in col)]
+    date_cols = [col for col in df.columns if '_date' in col]
+    categorical_cols = [col for col in df.columns if '_cat' in col]
+    
+    print(f"Found {len(numeric_cols)} numeric features, {len(date_cols)} date features, and {len(categorical_cols)} categorical features")
+    print(f"Number of unique categories in target: {df['category'].nunique()}")
+    
+    # Process date features - extract useful components
+    for col in date_cols:
+        # Extract year, month, day, day of week, day of year
+        df[f"{col}_year"] = pd.to_datetime(df[col]).dt.year
+        df[f"{col}_month"] = pd.to_datetime(df[col]).dt.month
+        df[f"{col}_day"] = pd.to_datetime(df[col]).dt.day
+        df[f"{col}_dayofweek"] = pd.to_datetime(df[col]).dt.dayofweek
+        df[f"{col}_dayofyear"] = pd.to_datetime(df[col]).dt.dayofyear
+        # Drop the original date column after extraction
+        df = df.drop(columns=[col])
+    
+    # One-hot encode categorical features
+    df = pd.get_dummies(df, columns=categorical_cols, prefix_sep='_')
+    
+    # Note: We're using the existing 'category' column now instead of creating a synthetic one
+    
+    print(f"Dataset shape after preprocessing: {df.shape}")
+    return df
 
 def build_model(input_dim, num_classes):
+    """Build a neural network model for classification with many classes"""
     model = models.Sequential()
     model.add(layers.InputLayer(input_shape=(input_dim,)))
 
+    # Increase layer sizes to handle the larger number of categories
     model.add(layers.Dense(1024, activation="relu"))
     model.add(layers.Dropout(0.4))
 
@@ -135,107 +79,90 @@ def build_model(input_dim, num_classes):
     model.add(layers.Dropout(0.4))
 
     model.add(layers.Dense(256, activation="relu"))
+    model.add(layers.Dropout(0.3))
 
+    # Output layer for multi-class classification
     model.add(layers.Dense(num_classes, activation="softmax"))
 
+    # Compile the model
     model.compile(
-        optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"]
+        optimizer="adam", 
+        loss="categorical_crossentropy", 
+        metrics=["accuracy"]
     )
 
     model.summary()
-
     return model
 
+# Main execution flow
+def main():
+    # Load dataset
+    print("Loading dataset...")
+    df = pd.read_csv("dataset.csv")
+    print(f"Dataset loaded with shape: {df.shape}")
 
-logger.info("starting")
+    # Preprocess the dataset
+    df = preprocess_dataset(df)
 
-servername = "bisqldwhd1"
-dbname = "MCH"
-engine = create_engine(
-    f"mssql+pyodbc://@{servername}/{dbname}?trusted_connection=yes&driver=ODBC+Driver+17+for+SQL+Server"
-)
-
-recreate_df = True
-
-
-# init
-if False:
-    with open("./SQL/master_query.sql", "r", encoding="utf-8") as file:
-        sql_script = file.read()
-        with engine.connect() as conn:
-            conn.execute(text(sql_script))
-            conn.commit()
-
-
-if recreate_df:
-    df = pd.read_sql(
-        "SELECT top 250000 * FROM [MCH].[SH\hm24].[yaakov_temp_table] WITH (NOLOCK)",
-        engine,
-    )
-    logger.info("sql selection finished")
-
-    df = append_y(df)
-    logger.info("append_y finished")
-
-    df = remove_irrelevant_cols(df)
-    logger.info("remove_irrelevant_cols finished")
-
-    df = remove_null_cols(df)
-    logger.info("remove_null_cols finished")
-
-    df = remove_single_value_cols(df)
-    logger.info("remove_single_value_cols finished")
-
-    # df = remove_correlated_features(df, threshold=0.95)
-    # logger.info("remove_correlated_features finished")
-
-    logger.info(f"Total rows: {len(df)}")
-
-logger.info(f"Total features before one-hot: {len(df.columns)}")
-df = make_oneot(df)
-logger.info(f"Total features after one-hot: {len(df.columns)}")
-
-
-load_existing = False
-
-if load_existing and os.path.exists("model_onehot_encoder.pkl"):
-    encoder = joblib.load("model_onehot_encoder.pkl")
-else:
+    # Prepare the target variable
     encoder = OneHotEncoder(sparse_output=False)
-    encoder.fit(df[["category"]])
-    joblib.dump(encoder, "model_onehot_encoder.pkl")  # Save encoder
+    categories_one_hot = encoder.fit_transform(df[["category"]])
+    num_classes = len(encoder.categories_[0])
+    print(f"Number of classes: {num_classes}")
 
+    # Remove TIK and category from features
+    X = df.drop(columns=["TIK", "category"])
+    input_dim = X.shape[1]
 
-categories_one_hot = encoder.transform(df[["category"]])
-num_classes = len(encoder.categories_[0])
+    # Scale numeric features
+    scaler = StandardScaler()
+    numeric_cols = [col for col in X.columns if 
+                   not '_' in col or  # Original numeric features
+                   col.endswith('_year') or  # Date derived features
+                   col.endswith('_month') or
+                   col.endswith('_day') or
+                   col.endswith('_dayofweek') or
+                   col.endswith('_dayofyear')]
+    
+    X[numeric_cols] = scaler.fit_transform(X[numeric_cols])
 
-df = df.drop(columns=["category"])
-input_dim = df.drop(columns=["TIK"]).shape[1]
+    # Split data into train and test sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, categories_one_hot, test_size=0.2, random_state=42
+    )
 
+    print(f"Training with {X_train.shape[1]} features and {num_classes} classes")
 
-X_train, X_test, y_train, y_test = train_test_split(
-    df.drop(columns=["TIK"]), categories_one_hot, test_size=0.2, random_state=42
-)
+    # Build and train the model
+    model = build_model(input_dim, num_classes)
 
-if load_existing and os.path.exists("model_checkpoint.keras"):
-    logger.info("Loading saved model...")
-    model = keras.models.load_model("model_checkpoint.keras")
-else:
-    logger.info("Initializing new model...")
-    model = another_model(input_dim, num_classes)  # build_model(input_dim, num_classes)
+    # Adjust training parameters for a larger model
+    epochs = 30
+    batch_size = 128
+    
+    print(f"Starting training with {epochs} epochs and batch size {batch_size}")
+    
+    # Train the model
+    model.fit(
+        X_train,
+        y_train,
+        epochs=epochs,
+        batch_size=batch_size,
+        validation_data=(X_test, y_test),
+        callbacks=[checkpoint_best_callback, checkpoint_callback],
+    )
 
+    # Evaluate the model
+    score = model.evaluate(X_test, y_test, verbose=0)
+    print(f"Test loss: {score[0]}")
+    print(f"Test accuracy: {score[1]}")
 
-model.summary()
+    # Save the model and preprocessing components
+    model.save("synthetic_dataset_model.keras")
+    joblib.dump(scaler, "feature_scaler.pkl")
+    joblib.dump(encoder, "target_encoder.pkl")
+    
+    print("Model and preprocessing components saved")
 
-
-# Train the model
-model.fit(
-    X_train,
-    y_train,
-    epochs=1500,
-    batch_size=64,
-    validation_data=(X_test, y_test),
-    callbacks=[checkpoint_best_callback, checkpoint_callback],
-)
-
-model.summary()
+if __name__ == "__main__":
+    main()

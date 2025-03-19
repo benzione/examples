@@ -1,3 +1,11 @@
 SQLAlchemy==2.0.20
 pandas
 pyodbc==5.2.0
+numpy
+tensorflow
+scikit-learn
+matplotlib
+seaborn
+joblib
+shap
+BorutaShap
