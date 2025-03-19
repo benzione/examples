@@ -182,6 +182,9 @@ class ManualBoruta:
         """
         print("Running manual Boruta feature selection...")
         
+        # Store the target variable for later use
+        self.y = y
+        
         # Run for specified number of iterations
         for i in range(self.max_iter):
             # Get feature importances
@@ -247,10 +250,15 @@ class ManualBoruta:
         self.fit(X, y)
         return self.transform(X)
     
-    def get_support(self):
+    def get_support(self, X):
         """
         Get mask of selected features
         
+        Parameters:
+        -----------
+        X : pandas DataFrame
+            Feature dataframe
+            
         Returns:
         --------
         support : numpy array
@@ -260,7 +268,7 @@ class ManualBoruta:
         
         return np.array([col in selected_features for col in X.columns])
     
-    def get_feature_importance(self, X):
+    def get_feature_importance(self, X, y=None):
         """
         Get feature importances for all features
         
@@ -268,12 +276,21 @@ class ManualBoruta:
         -----------
         X : pandas DataFrame
             Feature dataframe
+        y : pandas Series or numpy array, optional
+            Target variable. If None, will use the stored target from fit
             
         Returns:
         --------
         importance_df : pandas DataFrame
             DataFrame with feature importance and status
         """
+        # Use stored y if not provided
+        if y is None:
+            if hasattr(self, 'y'):
+                y = self.y
+            else:
+                raise ValueError("Target variable 'y' not provided and not stored from previous fit")
+                
         # Calculate final feature importances
         self.model.fit(X, y)
         importances = self.model.feature_importances_
@@ -292,7 +309,7 @@ class ManualBoruta:
         
         return importance_df
     
-    def plot_importances(self, X, top_n=30):
+    def plot_importances(self, X, y=None, top_n=30):
         """
         Plot feature importances
         
@@ -300,6 +317,8 @@ class ManualBoruta:
         -----------
         X : pandas DataFrame
             Feature dataframe
+        y : pandas Series or numpy array, optional
+            Target variable. If None, will use the stored target from fit
         top_n : int
             Number of top features to plot
             
@@ -309,7 +328,7 @@ class ManualBoruta:
             Figure with feature importances
         """
         # Get feature importances
-        importance_df = self.get_feature_importance(X)
+        importance_df = self.get_feature_importance(X, y)
         
         # Create figure
         plt.figure(figsize=(10, 12))
@@ -387,66 +406,111 @@ def run_manual_boruta_shap(X, y, model=None, n_estimators=100, max_iter=100):
         else:
             X_sample = X
             
+        # Ensure all data is numeric and handle NaN values
+        X_sample_clean = X_sample.copy()
+        
+        # Check for non-numeric columns and convert if possible
+        for col in X_sample_clean.columns:
+            if X_sample_clean[col].dtype == 'object':
+                print(f"Warning: Column '{col}' has object dtype. Trying to convert to numeric...")
+                try:
+                    X_sample_clean[col] = pd.to_numeric(X_sample_clean[col])
+                except:
+                    print(f"Warning: Could not convert column '{col}' to numeric. Dropping this column.")
+                    X_sample_clean = X_sample_clean.drop(columns=[col])
+            
+        # Handle NaN values
+        if X_sample_clean.isna().any().any():
+            print("Warning: Dataset contains NaN values. Filling with column means...")
+            X_sample_clean = X_sample_clean.fillna(X_sample_clean.mean())
+        
+        # Make sure we still have the same columns after cleaning
+        missing_cols = set(X.columns) - set(X_sample_clean.columns)
+        if missing_cols:
+            print(f"Warning: {len(missing_cols)} columns were dropped during cleaning: {missing_cols}")
+        
         # Create background dataset for SHAP
-        X_summary = shap.kmeans(X_sample, 50)
+        try:
+            X_summary = shap.kmeans(X_sample_clean, min(50, len(X_sample_clean)))
+        except Exception as e:
+            print(f"Warning: Error during kmeans clustering: {e}")
+            print("Using mean of the data as background instead...")
+            X_summary = X_sample_clean.mean().values.reshape(1, -1)
         
         # Create explainer
-        explainer = shap.KernelExplainer(model.predict, X_summary)
-        
-        # Calculate SHAP values
-        shap_values = explainer.shap_values(X_sample)
-        
-        # Create a DataFrame with SHAP importance values
-        shap_importance = np.zeros(len(X.columns))
-        for class_idx in range(len(shap_values)):
-            shap_importance += np.abs(shap_values[class_idx]).mean(axis=0)
-        
-        shap_importance_df = pd.DataFrame({
-            'Feature': X.columns.tolist(),
-            'SHAP_Importance': shap_importance / len(shap_values)
-        }).sort_values('SHAP_Importance', ascending=False)
-        
-        # Get top features from SHAP
-        num_boruta_features = len(boruta_features)
-        top_shap_features = shap_importance_df['Feature'].values[:num_boruta_features].tolist()
-        
-        # Combine features
-        final_features = list(set(boruta_features + top_shap_features))
-        
-        # Merge importance dataframes
-        combined_df = pd.merge(
-            boruta_importance,
-            shap_importance_df,
-            on='Feature',
-            how='outer'
-        )
-        combined_df['Final_Selected'] = combined_df['Feature'].isin(final_features)
-        
-        # Plot combined feature importance
-        plt.figure(figsize=(12, 8))
-        top_combined = combined_df[combined_df['Final_Selected']].sort_values('SHAP_Importance', ascending=False).head(30)
-        
-        # Create color map
-        colors = ['blue' if row['Status'] == 'Accepted' else 'red' for _, row in top_combined.iterrows()]
-        
-        # Create bar plot
-        sns.barplot(x='SHAP_Importance', y='Feature', data=top_combined, palette=colors)
-        plt.title('Top 30 Selected Features (Blue: Boruta Selected, Red: SHAP Added)')
-        plt.tight_layout()
-        
-        # Save figure
-        os.makedirs('plots', exist_ok=True)
-        plt.savefig('plots/manual_combined_importances.png', dpi=300, bbox_inches='tight')
-        
-        # Save results
-        combined_df.to_csv('manual_feature_importance.csv', index=False)
-        pd.DataFrame({'Feature': final_features}).to_csv('manual_selected_features.csv', index=False)
-        
-        return final_features, combined_df
-    
-    else:
-        # If no model provided, just return Boruta results
-        return boruta_features, boruta_importance
+        try:
+            # Get prediction function that accepts dataframes
+            pred_func = lambda x: model.predict(x)
+            
+            # Create the explainer
+            explainer = shap.KernelExplainer(pred_func, X_summary)
+            
+            # Calculate SHAP values
+            shap_values = explainer.shap_values(X_sample_clean)
+            
+            # Create a DataFrame with SHAP importance values
+            shap_importance = np.zeros(len(X_sample_clean.columns))
+            for class_idx in range(len(shap_values)):
+                shap_importance += np.abs(shap_values[class_idx]).mean(axis=0)
+            
+            shap_importance_df = pd.DataFrame({
+                'Feature': X_sample_clean.columns.tolist(),
+                'SHAP_Importance': shap_importance / len(shap_values)
+            }).sort_values('SHAP_Importance', ascending=False)
+            
+            # Get top features from SHAP
+            num_boruta_features = len(boruta_features)
+            # Make sure we only select features that are in our cleaned dataset
+            valid_shap_features = [f for f in shap_importance_df['Feature'].values.tolist() 
+                                 if f in X.columns][:num_boruta_features]
+            
+            # Combine features
+            final_features = list(set(boruta_features + valid_shap_features))
+            
+            # Merge importance dataframes - only merge features that exist in both
+            common_features = set(boruta_importance['Feature']).intersection(set(shap_importance_df['Feature']))
+            boruta_importance_filtered = boruta_importance[boruta_importance['Feature'].isin(common_features)]
+            shap_importance_df_filtered = shap_importance_df[shap_importance_df['Feature'].isin(common_features)]
+            
+            combined_df = pd.merge(
+                boruta_importance_filtered,
+                shap_importance_df_filtered,
+                on='Feature',
+                how='outer'
+            )
+            combined_df['Final_Selected'] = combined_df['Feature'].isin(final_features)
+            
+            # Plot combined feature importance
+            plt.figure(figsize=(12, 8))
+            top_combined = combined_df[combined_df['Final_Selected']].sort_values('SHAP_Importance', ascending=False).head(30)
+            
+            if not top_combined.empty:
+                # Create color map
+                colors = ['blue' if row['Status'] == 'Accepted' else 'red' for _, row in top_combined.iterrows()]
+                
+                # Create bar plot
+                sns.barplot(x='SHAP_Importance', y='Feature', data=top_combined, palette=colors)
+                plt.title('Top 30 Selected Features (Blue: Boruta Selected, Red: SHAP Added)')
+                plt.tight_layout()
+                
+                # Save figure
+                os.makedirs('plots', exist_ok=True)
+                plt.savefig('plots/manual_combined_importances.png', dpi=300, bbox_inches='tight')
+            else:
+                print("Warning: No combined features to plot")
+            
+            # Save results
+            combined_df.to_csv('manual_feature_importance.csv', index=False)
+            pd.DataFrame({'Feature': final_features}).to_csv('manual_selected_features.csv', index=False)
+            
+            return final_features, combined_df
+            
+        except Exception as e:
+            print(f"Error during SHAP calculation: {e}")
+            print("Falling back to Boruta results only")
+            
+    # If no model provided or SHAP calculation failed, just return Boruta results
+    return boruta_features, boruta_importance
 
 if __name__ == "__main__":
     # Example usage

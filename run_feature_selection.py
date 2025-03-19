@@ -24,6 +24,8 @@ def parse_arguments():
                         help='Use manual implementation of Boruta algorithm')
     parser.add_argument('--iterations', type=int, default=100,
                         help='Number of iterations for manual Boruta')
+    parser.add_argument('--sample', type=int, default=2000,
+                        help='Number of samples to use for SHAP calculations (larger = slower)')
     return parser.parse_args()
 
 def main():
@@ -68,6 +70,12 @@ def main():
             scaler = joblib.load(args.scaler)
             encoder = joblib.load(args.encoder)
             
+            # Check if it's a large dataset and print warning
+            if df_processed.shape[0] > 10000:
+                print(f"Warning: Large dataset detected ({df_processed.shape[0]} rows). This may take a while.")
+                if not args.sample:
+                    print(f"Consider using --sample to reduce the number of samples used for SHAP calculations.")
+            
             # Prepare the target variable
             categories_one_hot = encoder.transform(df_processed[["category"]])
             categories = df_processed["category"].values
@@ -76,6 +84,8 @@ def main():
             # Remove TIK and category from features
             X = df_processed.drop(columns=["TIK", "category"])
             feature_names = X.columns.tolist()
+            
+            print(f"Dataset has {X.shape[1]} features and {X.shape[0]} samples")
             
             # Scale numeric features
             numeric_cols = [col for col in X.columns if 
@@ -88,37 +98,54 @@ def main():
             
             X[numeric_cols] = scaler.transform(X[numeric_cols])
             
+            # Check for non-numeric columns
+            object_cols = X.select_dtypes(include=['object']).columns.tolist()
+            if object_cols:
+                print(f"Warning: {len(object_cols)} non-numeric columns detected. These may be dropped during SHAP calculation.")
+                print(f"Non-numeric columns: {object_cols[:5]}...")
+            
             # Load the trained model
             from tensorflow import keras
             model = keras.models.load_model(args.model)
             
             # Run manual Boruta with SHAP
+            print(f"Running manual Boruta with {args.iterations} iterations...")
             final_features, importance_df = run_manual_boruta_shap(
                 X, categories, model=model, max_iter=args.iterations
             )
             
             # Print selected features
-            print("\nTop 20 selected features:")
-            for i, feature in enumerate(final_features[:20]):
-                print(f"{i+1}. {feature}")
+            if final_features:
+                print(f"\nSelected {len(final_features)} features")
+                print("\nTop 20 selected features:")
+                for i, feature in enumerate(final_features[:20]):
+                    print(f"{i+1}. {feature}")
+                    
+                # Optionally retrain model
+                if args.retrain:
+                    print("\nRetraining model with selected features...")
+                    try:
+                        from boruta_shap_selection import retrain_with_selected_features
+                        new_model, history = retrain_with_selected_features(
+                            X, categories_one_hot, final_features, args.model
+                        )
+                        print("\nFeature selection and model retraining complete!")
+                    except Exception as e:
+                        print(f"Error during model retraining: {str(e)}")
+                        print("Feature selection completed, but retraining failed.")
+                else:
+                    print("\nFeature selection complete without retraining!")
                 
-            # Optionally retrain model
-            if args.retrain:
-                print("\nRetraining model with selected features...")
-                from boruta_shap_selection import retrain_with_selected_features
-                new_model, history = retrain_with_selected_features(
-                    X, categories_one_hot, final_features, args.model
-                )
-                print("\nFeature selection and model retraining complete!")
+                print("Check the 'plots' directory for feature importance visualizations")
+                print("Check 'manual_selected_features.csv' for the list of selected features")
+                print("Check 'manual_feature_importance.csv' for detailed feature importance scores")
             else:
-                print("\nFeature selection complete without retraining!")
-            
-            print("Check the 'plots' directory for feature importance visualizations")
-            print("Check 'manual_selected_features.csv' for the list of selected features")
-            print("Check 'manual_feature_importance.csv' for detailed feature importance scores")
+                print("No features were selected. Try increasing the number of iterations with --iterations")
             
         except Exception as e:
             print(f"Error during manual feature selection: {str(e)}")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
             
     else:
@@ -146,23 +173,27 @@ def main():
             )
             
             # Print selected features
-            print("\nTop 20 selected features:")
-            for i, feature in enumerate(final_features[:20]):
-                print(f"{i+1}. {feature}")
-            
-            # Optionally retrain model
-            if args.retrain:
-                print("\nRetraining model with selected features...")
-                new_model, history = retrain_with_selected_features(
-                    X, y_one_hot, final_features, args.model
-                )
-                print("\nFeature selection and model retraining complete!")
+            if final_features:
+                print(f"\nSelected {len(final_features)} features")
+                print("\nTop 20 selected features:")
+                for i, feature in enumerate(final_features[:20]):
+                    print(f"{i+1}. {feature}")
+                
+                # Optionally retrain model
+                if args.retrain:
+                    print("\nRetraining model with selected features...")
+                    new_model, history = retrain_with_selected_features(
+                        X, y_one_hot, final_features, args.model
+                    )
+                    print("\nFeature selection and model retraining complete!")
+                else:
+                    print("\nFeature selection complete without retraining!")
+                
+                print("Check the 'shap_plots' directory for feature importance visualizations")
+                print("Check 'selected_features.csv' for the list of selected features")
+                print("Check 'feature_importance.csv' for detailed feature importance scores")
             else:
-                print("\nFeature selection complete without retraining!")
-            
-            print("Check the 'shap_plots' directory for feature importance visualizations")
-            print("Check 'selected_features.csv' for the list of selected features")
-            print("Check 'feature_importance.csv' for detailed feature importance scores")
+                print("No features were selected. Try the manual implementation with --manual")
             
         except ImportError as e:
             print(f"Error importing BorutaShap: {e}")
@@ -176,6 +207,8 @@ def main():
             print(f"Error during feature selection: {str(e)}")
             print("Try using the manual implementation with the --manual flag:")
             print("  python run_feature_selection.py --manual")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
 
 if __name__ == "__main__":
