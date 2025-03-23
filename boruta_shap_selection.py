@@ -1,433 +1,418 @@
+#!/usr/bin/env python
+"""
+Boruta-SHAP feature selection implementation
+This combines the Boruta algorithm with SHAP values for feature importance
+"""
+
 import os
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from tensorflow import keras
-import shap
 import matplotlib.pyplot as plt
-import joblib
-from sklearn.ensemble import RandomForestClassifier
-from BorutaShap import BorutaShap
 import seaborn as sns
+import shap
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from preprocess import preprocess_dataset
 
-def load_preprocessed_data(dataset_path, scaler_path, encoder_path):
-    """
-    Load and preprocess the dataset using saved preprocessing components
-    """
-    print("Loading dataset...")
-    df = pd.read_csv(dataset_path)
-    print(f"Dataset loaded with shape: {df.shape}")
-    
-    # Reuse the preprocessing logic from main.py
-    from main import preprocess_dataset
-    df_processed = preprocess_dataset(df)
-    
-    # Load the saved scaler and encoder
-    scaler = joblib.load(scaler_path)
-    encoder = joblib.load(encoder_path)
-    
-    # Prepare the target variable
-    categories_one_hot = encoder.transform(df_processed[["category"]])
-    categories = df_processed["category"].values
-    
-    # Remove TIK and category from features
-    X = df_processed.drop(columns=["TIK", "category"])
-    feature_names = X.columns.tolist()
-    
-    # Scale numeric features
-    numeric_cols = [col for col in X.columns if 
-                   not '_' in col or  # Original numeric features
-                   col.endswith('_year') or  # Date derived features
-                   col.endswith('_month') or
-                   col.endswith('_day') or
-                   col.endswith('_dayofweek') or
-                   col.endswith('_dayofyear')]
-    
-    X[numeric_cols] = scaler.transform(X[numeric_cols])
-    
-    return X, categories, feature_names, categories_one_hot, encoder.categories_[0]
 
-def boruta_feature_selection(X, y, feature_names, verbose=True, n_estimators=100):
+class BorutaSHAP:
     """
-    Perform Boruta feature selection using BorutaShap
+    Implementation of Boruta algorithm using SHAP values for feature importance
+    """
+    
+    def __init__(self, model=None, n_estimators=100, max_iter=20, perc=100, alpha=0.05, random_state=42):
+        """
+        Initialize the Boruta-SHAP algorithm
+        
+        Parameters:
+        -----------
+        model : object
+            Pre-trained model to use for SHAP value calculation
+        n_estimators : int
+            Number of trees in the random forest (used if model is not provided)
+        max_iter : int
+            Maximum number of iterations to perform
+        perc : int
+            Percentile to use for shadow feature importance
+        alpha : float
+            Significance level
+        random_state : int
+            Random state for reproducibility
+        """
+        self.model = model
+        self.n_estimators = n_estimators
+        self.max_iter = max_iter
+        self.perc = perc
+        self.alpha = alpha
+        self.random_state = random_state
+        
+        # If no model is provided, create a random forest
+        if self.model is None:
+            self.model = RandomForestClassifier(
+                n_estimators=self.n_estimators,
+                max_depth=7,
+                n_jobs=-1, 
+                random_state=self.random_state
+            )
+        
+        # Initialize feature status arrays
+        self.features_accepted = []
+        self.features_rejected = []
+        self.features_tentative = []
+        self.importance_history = []
+        
+    def fit(self, X, y):
+        """
+        Run the Boruta-SHAP algorithm
+        
+        Parameters:
+        -----------
+        X : pandas DataFrame
+            Feature matrix
+        y : array-like
+            Target variable
+        
+        Returns:
+        --------
+        self : object
+            Returns self
+        """
+        # Get feature names
+        if isinstance(X, pd.DataFrame):
+            feature_names = X.columns.tolist()
+            X_values = X.values
+        else:
+            feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+            X_values = X
+            X = pd.DataFrame(X, columns=feature_names)
+        
+        # Initialize all features as tentative
+        self.features_tentative = feature_names.copy()
+        self.features_accepted = []
+        self.features_rejected = []
+        
+        # Create shadow features
+        for iteration in range(self.max_iter):
+            print(f"Iteration {iteration+1}/{self.max_iter}")
+            
+            # Break if all features are accepted or rejected
+            if len(self.features_tentative) == 0:
+                print("All features have been classified. Stopping early.")
+                break
+            
+            # Create shadow features by permuting the values of each feature
+            X_shadow = X.copy()
+            
+            # Debug: Print data types of columns
+            print("\nColumn data types:")
+            for col in X_shadow.columns:
+                print(f"  - {col}: {X_shadow[col].dtype}")
+            
+            # Create shadow features for all columns
+            # We'll handle bool conversion in get_feature_importance
+            for col in X.columns:
+                X_shadow[f"shadow_{col}"] = X_shadow[col].sample(frac=1, random_state=self.random_state+iteration).values
+            
+            # Debug: Print shadow feature columns created
+            shadow_cols = [col for col in X_shadow.columns if col.startswith('shadow_')]
+            print(f"\nCreated {len(shadow_cols)} shadow feature columns")
+            
+            # Get feature importance using SHAP
+            try:
+                importance_df = self.get_feature_importance(X_shadow, y)
+                self.importance_history.append(importance_df)
+                
+                # Separate real and shadow feature importances
+                real_features = importance_df[~importance_df['Feature'].str.startswith('shadow_')]
+                shadow_features = importance_df[importance_df['Feature'].str.startswith('shadow_')]
+                
+                if len(shadow_features) == 0:
+                    print("Warning: No shadow features were created. Check if data contains non-numeric values.")
+                    break
+                
+                # Calculate threshold as the percentile of shadow feature importances
+                shadow_threshold = np.percentile(shadow_features['Importance'].values, self.perc)
+                
+                # Update feature status
+                for _, row in real_features.iterrows():
+                    feature = row['Feature']
+                    importance = row['Importance']
+                    
+                    # Skip if feature is already accepted or rejected
+                    if feature in self.features_accepted or feature in self.features_rejected:
+                        continue
+                    
+                    # Accept features with importance > threshold
+                    if importance > shadow_threshold:
+                        if feature in self.features_tentative:
+                            self.features_tentative.remove(feature)
+                        self.features_accepted.append(feature)
+                    
+                    # Reject features with importance < threshold
+                    elif importance < shadow_threshold:
+                        if feature in self.features_tentative:
+                            self.features_tentative.remove(feature)
+                        self.features_rejected.append(feature)
+                
+                print(f"  Accepted: {len(self.features_accepted)}, Rejected: {len(self.features_rejected)}, Tentative: {len(self.features_tentative)}")
+            
+            except Exception as e:
+                print(f"Error in iteration {iteration+1}: {str(e)}")
+                # If we have at least one successful iteration, we can continue
+                if len(self.importance_history) > 0:
+                    print("Using results from previous successful iterations.")
+                    break
+                else:
+                    raise
+        
+        return self
+    
+    def get_feature_importance(self, X, y):
+        """
+        Calculate feature importance using SHAP values
+        
+        Parameters:
+        -----------
+        X : pandas DataFrame
+            Feature matrix
+        y : array-like
+            Target variable
+        
+        Returns:
+        --------
+        importance_df : pandas DataFrame
+            DataFrame with feature names and importance values
+        """
+        # Convert boolean columns to float64 instead of dropping them
+        X_numeric = X.copy()
+        boolean_cols = []
+        
+        for col in X_numeric.columns:
+            if X_numeric[col].dtype == bool:
+                boolean_cols.append(col)
+                X_numeric[col] = X_numeric[col].astype(float)
+            elif X_numeric[col].dtype == 'object':
+                print(f"Warning: Column {col} contains object type data and will be excluded from SHAP analysis")
+                X_numeric = X_numeric.drop(columns=[col])
+                
+        if boolean_cols:
+            print(f"Converted {len(boolean_cols)} boolean columns to float64")
+            
+        if X_numeric.shape[1] == 0:
+            raise ValueError("No numeric features available for SHAP analysis after filtering")
+            
+        # Debug: Print the dtypes after conversion
+        print("\nNumeric columns data types after conversion:")
+        for col in X_numeric.columns:
+            print(f"  - {col}: {X_numeric[col].dtype}")
+        
+        # Use only the external model as requested
+        model_to_explain = self.model
+        
+        # Create SHAP explainer
+        print(f"Creating SHAP explainer for model type: {type(model_to_explain).__name__}")
+        
+        try:
+            # Convert DataFrame to numpy array to avoid object dtype issues
+            X_numpy = X_numeric.values.astype(np.float64)
+            
+            # For Keras/TensorFlow models, we need to use a different approach
+            if 'keras' in str(type(model_to_explain)).lower():
+                print("Using custom permutation importance for Keras model")
+                
+                # Split into real and shadow features
+                real_features = [col for col in X_numeric.columns if not col.startswith('shadow_')]
+                shadow_features = [col for col in X_numeric.columns if col.startswith('shadow_')]
+                
+                # Check if y is already one-hot encoded
+                if len(y.shape) == 1 or y.shape[1] == 1:
+                    # Need to convert y to one-hot
+                    print("Converting target to one-hot encoding")
+                    from sklearn.preprocessing import OneHotEncoder
+                    encoder = OneHotEncoder(sparse_output=False)
+                    # Reshape to 2D array if needed
+                    y_2d = y.reshape(-1, 1) if len(y.shape) == 1 else y
+                    y_onehot = encoder.fit_transform(y_2d)
+                else:
+                    # Already one-hot
+                    y_onehot = y
+                
+                # Calculate importance directly with permutation importance
+                X_real = X_numeric[real_features]
+                
+                # Get baseline predictions
+                baseline_preds = model_to_explain.predict(X_real.values, verbose=0)
+                
+                importance_values = np.zeros(len(real_features))
+                
+                print(f"Calculating permutation importance for {len(real_features)} features")
+                for i, feature in enumerate(real_features):
+                    # Create a copy with the feature permuted
+                    X_permuted = X_real.copy()
+                    X_permuted[feature] = X_real[feature].sample(frac=1, random_state=self.random_state).values
+                    
+                    # Get predictions with permuted feature
+                    permuted_preds = model_to_explain.predict(X_permuted.values, verbose=0)
+                    
+                    # Calculate importance as mean absolute difference in predictions
+                    importance_values[i] = np.mean(np.abs(baseline_preds - permuted_preds))
+                
+                # Create shadow feature importance by copying from original features
+                shadow_importance = np.zeros(len(shadow_features))
+                for i, shadow_feature in enumerate(shadow_features):
+                    # Extract the original feature name by removing the "shadow_" prefix
+                    orig_feature = shadow_feature[7:]  # Remove 'shadow_' prefix
+                    
+                    # Find the index of the original feature
+                    if orig_feature in real_features:
+                        orig_idx = real_features.index(orig_feature)
+                        shadow_importance[i] = importance_values[orig_idx]
+                    else:
+                        # If original feature not found, assign zero importance
+                        shadow_importance[i] = 0
+                
+                # Combine real and shadow importances
+                all_importance = np.concatenate([importance_values, shadow_importance])
+                all_features = real_features + shadow_features
+                
+            else:
+                # For tree-based models, use TreeExplainer
+                explainer = shap.Explainer(model_to_explain, X_numpy)
+                shap_values = explainer(X_numpy)
+                
+                # For multi-class, take the mean absolute SHAP value across all classes
+                if len(shap_values.shape) > 2:
+                    all_importance = np.abs(shap_values.values).mean(axis=(0, 2))
+                else:
+                    all_importance = np.abs(shap_values.values).mean(axis=0)
+                
+                all_features = X_numeric.columns.tolist()
+        except Exception as e:
+            print(f"Error creating SHAP explainer with external model: {str(e)}")
+            raise
+        
+        # Create DataFrame with feature names and importance values
+        importance_df = pd.DataFrame({
+            'Feature': all_features,
+            'Importance': all_importance
+        })
+        
+        # Sort by importance
+        importance_df = importance_df.sort_values('Importance', ascending=False).reset_index(drop=True)
+        
+        return importance_df
+    
+    def plot_feature_importance(self, top_n=20):
+        """
+        Plot feature importance
+        
+        Parameters:
+        -----------
+        top_n : int
+            Number of top features to plot
+        
+        Returns:
+        --------
+        fig : matplotlib figure
+            Figure object
+        """
+        # Get the latest importance values
+        if not self.importance_history:
+            raise ValueError("No feature importance history available. Run fit() first.")
+        
+        importance_df = self.importance_history[-1]
+        real_features = importance_df[~importance_df['Feature'].str.startswith('shadow_')]
+        
+        # Plot top N features
+        plt.figure(figsize=(10, 8))
+        sns.barplot(x='Importance', y='Feature', data=real_features.head(top_n))
+        plt.title(f'Top {top_n} Feature Importance (SHAP)')
+        plt.tight_layout()
+        
+        # Save the plot
+        os.makedirs('plots', exist_ok=True)
+        plt.savefig('plots/boruta_shap_importance.png')
+        
+        return plt.gcf()
+
+
+def run_boruta_shap_selection(X, y, feature_names, iterations=20, external_model=None):
+    """
+    Run Boruta-SHAP feature selection
     
     Parameters:
     -----------
     X : pandas DataFrame
-        Features
-    y : numpy array
-        Target variable (not one-hot encoded)
+        Feature matrix
+    y : array-like
+        Target variable
     feature_names : list
         List of feature names
-    verbose : bool
-        Whether to print verbose output
-    n_estimators : int
-        Number of estimators for the RandomForest
-        
+    iterations : int
+        Number of iterations for Boruta
+    external_model : object
+        Pre-trained model to use for SHAP value calculation
+    
     Returns:
     --------
-    selected_feature_names : list
+    selected_features : list
         List of selected feature names
     importance_df : pandas DataFrame
-        DataFrame with feature importance values
+        DataFrame with feature names and importance values
     """
-    print("Running Boruta feature selection with BorutaShap...")
+    # Convert target to numeric if needed
+    if not np.issubdtype(y.dtype, np.number):
+        le = LabelEncoder()
+        y_numeric = le.fit_transform(y)
+    else:
+        y_numeric = y
     
-    # Convert y to pandas Series with proper name for compatibility
-    y_series = pd.Series(y, name='target')
+    # Run Boruta-SHAP
+    boruta = BorutaSHAP(model=external_model, max_iter=iterations)
+    boruta.fit(X, y_numeric)
     
-    # Initialize Random Forest for Boruta
-    rf = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, random_state=42)
+    # Get feature importances
+    importance_df = boruta.importance_history[-1]
+    importance_df = importance_df[~importance_df['Feature'].str.startswith('shadow_')]
     
-    # Initialize BorutaShap
-    # Note: BorutaShap directly computes SHAP values internally
-    boruta_shap = BorutaShap(model=rf, importance_measure='shap', classification=True)
+    # Get selected features (accepted + tentative)
+    selected_features = boruta.features_accepted + boruta.features_tentative
     
-    # Execute Boruta feature selection 
-    boruta_shap.fit(X=X, y=y_series, n_trials=100, sample=False, verbose=verbose)
+    print(f"\nSelected {len(selected_features)} features")
+    print(f"  - Accepted features: {len(boruta.features_accepted)}")
+    print(f"  - Tentative features: {len(boruta.features_tentative)}")
     
-    # Get the feature ranking and selection results
-    feature_ranks = boruta_shap.check_features()
+    # Categorize selected features by type
+    numeric_selected = [f for f in selected_features if 
+                      f.startswith('feature_') and 
+                      not any(suffix in f for suffix in ['_cat_', '_year', '_month', '_day', '_dayofweek', '_dayofyear'])]
     
-    # Extracted selected features
-    selected_features = feature_ranks[feature_ranks['Decision'] == 'Accepted'].index.tolist()
-    tentative_features = feature_ranks[feature_ranks['Decision'] == 'Tentative'].index.tolist()
+    date_selected = [f for f in selected_features if 
+                  any(suffix in f for suffix in ['_year', '_month', '_day', '_dayofweek', '_dayofyear'])]
     
-    print(f"Selected {len(selected_features)} features")
-    print(f"Tentative features: {len(tentative_features)}")
+    cat_selected = [f for f in selected_features if 
+                any(f"feature_{i}_cat_" in f for i in range(100))]
     
-    # Add selection status to the importance dataframe
-    feature_ranks['Selected'] = feature_ranks['Decision'] == 'Accepted'
-    feature_ranks['Tentative'] = feature_ranks['Decision'] == 'Tentative'
+    print("\nSelected features by type:")
+    print(f"  - Numeric features: {len(numeric_selected)}")
+    print(f"  - Date-derived features: {len(date_selected)}")
+    print(f"  - One-hot encoded categorical features: {len(cat_selected)}")
     
-    # Rename the column for consistency
-    importance_df = feature_ranks.rename(columns={
-        'Rank': 'Rank',
-        'Mean': 'Mean_Importance',
-        'Decision': 'Decision'
-    }).reset_index().rename(columns={'index': 'Feature'})
+    # Add feature type information
+    importance_df['Type'] = importance_df['Feature'].apply(lambda f: 
+        'Numeric' if f.startswith('feature_') and not any(suffix in f for suffix in ['_cat_', '_year', '_month', '_day', '_dayofweek', '_dayofyear']) else
+        'Date' if any(suffix in f for suffix in ['_year', '_month', '_day', '_dayofweek', '_dayofyear']) else
+        'Categorical'
+    )
     
-    # Sort by rank for better display
-    importance_df = importance_df.sort_values('Rank')
+    # Create plots directory
+    os.makedirs('plots', exist_ok=True)
     
-    if verbose:
-        print("Top 20 selected features by Boruta:")
-        print(importance_df[importance_df['Selected']].head(20))
+    # Plot feature importance
+    boruta.plot_feature_importance(top_n=min(20, len(selected_features)))
+    
+    # Save selected features and importance
+    pd.DataFrame({'Feature': selected_features}).to_csv('boruta_shap_selected_features.csv', index=False)
+    importance_df.to_csv('boruta_shap_feature_importance.csv', index=False)
     
     return selected_features, importance_df
-
-def calculate_shap_values(model, X, feature_names, class_names, plot=True, sample_size=500):
-    """
-    Calculate SHAP values for the trained model and create summary plots
-    
-    Parameters:
-    -----------
-    model : tensorflow.keras.Model
-        The trained model
-    X : pandas DataFrame
-        Features data
-    feature_names : list
-        List of feature names
-    class_names : list
-        List of class names
-    plot : bool
-        Whether to generate and save plots
-    sample_size : int
-        Number of samples to use for SHAP calculations
-
-    Returns:
-    --------
-    shap_importance_df : pandas DataFrame
-        DataFrame with feature importance based on SHAP values
-    """
-    print("Calculating SHAP values...")
-    
-    # If the dataset is large, use a sample
-    if X.shape[0] > sample_size:
-        X_sample = X.sample(sample_size, random_state=42)
-    else:
-        X_sample = X
-        
-    # Create a background dataset for SHAP
-    X_summary = shap.kmeans(X_sample, 50)
-    
-    # Create explainer
-    explainer = shap.KernelExplainer(model.predict, X_summary)
-    
-    # Calculate SHAP values
-    shap_values = explainer.shap_values(X_sample)
-    
-    # Create a DataFrame with SHAP importance values
-    shap_importance = np.zeros(len(feature_names))
-    for class_idx in range(len(shap_values)):
-        shap_importance += np.abs(shap_values[class_idx]).mean(axis=0)
-    
-    shap_importance_df = pd.DataFrame({
-        'Feature': feature_names,
-        'SHAP_Importance': shap_importance / len(shap_values)
-    }).sort_values('SHAP_Importance', ascending=False)
-    
-    if plot:
-        # Create output directory for plots
-        os.makedirs('shap_plots', exist_ok=True)
-        
-        # Global summary plot
-        plt.figure(figsize=(12, 8))
-        shap.summary_plot(shap_values, X_sample, feature_names=feature_names, 
-                          class_names=class_names, show=False)
-        plt.tight_layout()
-        plt.savefig('shap_plots/shap_summary.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        # Bar plot of feature importance
-        plt.figure(figsize=(12, 8))
-        shap.summary_plot(shap_values, X_sample, plot_type="bar", 
-                          feature_names=feature_names, class_names=class_names, show=False)
-        plt.tight_layout()
-        plt.savefig('shap_plots/shap_importance.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        # Save top 20 features importance as a bar chart
-        plt.figure(figsize=(10, 8))
-        sns.barplot(x='SHAP_Importance', y='Feature', 
-                    data=shap_importance_df.head(20))
-        plt.title('Top 20 Features by SHAP Importance')
-        plt.tight_layout()
-        plt.savefig('shap_plots/top_features_shap.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-    return shap_importance_df
-
-def boruta_shap_selection(X, y, y_one_hot, feature_names, class_names, model):
-    """
-    Feature selection using BorutaShap and additional SHAP values from the model
-    
-    Parameters:
-    -----------
-    X : pandas DataFrame
-        Features
-    y : numpy array
-        Target variable (not one-hot encoded)
-    y_one_hot : numpy array
-        One-hot encoded target variable
-    feature_names : list
-        List of feature names
-    class_names : list
-        List of class names
-    model : tensorflow.keras.Model
-        The trained model
-        
-    Returns:
-    --------
-    final_features : list
-        List of final selected feature names
-    """
-    # Run BorutaShap feature selection
-    boruta_features, boruta_importance = boruta_feature_selection(X, y, feature_names)
-    
-    # Also calculate SHAP values on the trained deep learning model for comparison
-    shap_importance = calculate_shap_values(model, X, feature_names, class_names)
-    
-    # Get top features from SHAP (as many as BorutaShap selected)
-    num_boruta_features = len(boruta_features)
-    top_shap_features = shap_importance['Feature'].values[:num_boruta_features].tolist()
-    
-    # Combine features from both methods
-    final_features = list(set(boruta_features + top_shap_features))
-    
-    print(f"Selected {len(final_features)} features using Boruta+SHAP approach")
-    print(f"BorutaShap selected {len(boruta_features)} features")
-    print(f"SHAP from DL model provided {len(top_shap_features)} top features")
-    print(f"Final unique features: {len(final_features)}")
-    
-    # Save the selected features
-    pd.DataFrame({'Feature': final_features}).to_csv('selected_features.csv', index=False)
-    
-    # Create a DataFrame combining both importance scores
-    combined_df = pd.merge(
-        boruta_importance, 
-        shap_importance,
-        on='Feature',
-        how='outer'
-    )
-    combined_df['Final_Selected'] = combined_df['Feature'].isin(final_features)
-    combined_df.to_csv('feature_importance.csv', index=False)
-    
-    # Plot combined feature importance
-    plt.figure(figsize=(12, 8))
-    top_combined = combined_df[combined_df['Final_Selected']].sort_values('SHAP_Importance', ascending=False).head(30)
-    
-    # Create a color map
-    colors = ['blue' if row['Selected'] else 'red' for _, row in top_combined.iterrows()]
-    
-    # Create bar plot
-    sns.barplot(x='SHAP_Importance', y='Feature', data=top_combined, palette=colors)
-    plt.title('Top 30 Selected Features (Blue: Boruta Selected, Red: SHAP Added)')
-    plt.tight_layout()
-    plt.savefig('shap_plots/combined_top_features.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return final_features, combined_df
-
-def retrain_with_selected_features(X, y_one_hot, final_features, model_architecture, epochs=20, batch_size=128):
-    """
-    Retrain the model using only the selected features
-    
-    Parameters:
-    -----------
-    X : pandas DataFrame
-        All features
-    y_one_hot : numpy array
-        One-hot encoded target variable
-    final_features : list
-        List of final selected feature names
-    model_architecture : str
-        Path to saved model architecture
-    epochs : int
-        Number of epochs for training
-    batch_size : int
-        Batch size for training
-        
-    Returns:
-    --------
-    model : tensorflow.keras.Model
-        The retrained model
-    """
-    from sklearn.model_selection import train_test_split
-    
-    # Reduce features to selected ones
-    X_selected = X[final_features]
-    
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_selected, y_one_hot, test_size=0.2, random_state=42
-    )
-    
-    # Load the original model to get the architecture
-    original_model = keras.models.load_model(model_architecture)
-    
-    # Create a new model with the same architecture but adjusted input dimension
-    input_dim = len(final_features)
-    num_classes = y_one_hot.shape[1]
-    
-    model = keras.Sequential()
-    model.add(keras.layers.InputLayer(input_shape=(input_dim,)))
-    
-    # Add the same hidden layers as the original model
-    for layer in original_model.layers[1:-1]:  # Skip input and output layers
-        config = layer.get_config()
-        weights = layer.get_weights()
-        model.add(keras.layers.Dense.from_config(config))
-        # Only set weights if shapes match (they might not due to different input dim)
-        if len(model.layers) > 1 and model.layers[-1].weights[0].shape == weights[0].shape:
-            model.layers[-1].set_weights(weights)
-    
-    # Add output layer
-    model.add(keras.layers.Dense(num_classes, activation="softmax"))
-    
-    # Compile
-    model.compile(
-        optimizer="adam", 
-        loss="categorical_crossentropy", 
-        metrics=["accuracy"]
-    )
-    
-    # Define checkpoint for the selected features model
-    checkpoint_callback = keras.callbacks.ModelCheckpoint(
-        filepath="model_selected_features_checkpoint.keras",
-        save_weights_only=False,
-        save_freq="epoch",
-        verbose=1,
-    )
-
-    checkpoint_best_callback = keras.callbacks.ModelCheckpoint(
-        filepath="model_selected_features_best.keras",
-        monitor="accuracy",
-        save_best_only=True,
-        save_weights_only=False,
-        verbose=1,
-    )
-    
-    # Train the model
-    print(f"Training model with {len(final_features)} selected features...")
-    history = model.fit(
-        X_train,
-        y_train,
-        epochs=epochs,
-        batch_size=batch_size,
-        validation_data=(X_test, y_test),
-        callbacks=[checkpoint_best_callback, checkpoint_callback],
-    )
-    
-    # Evaluate the model
-    score = model.evaluate(X_test, y_test, verbose=0)
-    print(f"Test loss with selected features: {score[0]}")
-    print(f"Test accuracy with selected features: {score[1]}")
-    
-    # Save the model
-    model.save("synthetic_dataset_model_selected_features.keras")
-    
-    # Plot training history
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(history.history['accuracy'])
-    plt.plot(history.history['val_accuracy'])
-    plt.title('Model Accuracy')
-    plt.ylabel('Accuracy')
-    plt.xlabel('Epoch')
-    plt.legend(['Train', 'Validation'], loc='upper left')
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(history.history['loss'])
-    plt.plot(history.history['val_loss'])
-    plt.title('Model Loss')
-    plt.ylabel('Loss')
-    plt.xlabel('Epoch')
-    plt.legend(['Train', 'Validation'], loc='upper left')
-    
-    plt.tight_layout()
-    plt.savefig('training_history_selected_features.png', dpi=300)
-    plt.close()
-    
-    return model, history
-
-def main():
-    # Load dataset and preprocessing components
-    X, y, feature_names, y_one_hot, class_names = load_preprocessed_data(
-        dataset_path="dataset.csv",
-        scaler_path="feature_scaler.pkl",
-        encoder_path="target_encoder.pkl"
-    )
-    
-    # Load the trained model
-    model = keras.models.load_model("synthetic_dataset_model.keras")
-    
-    # Perform combined feature selection
-    final_features, importance_df = boruta_shap_selection(
-        X, y, y_one_hot, feature_names, class_names, model
-    )
-    
-    # Print selected features
-    print("\nTop 20 selected features:")
-    for i, feature in enumerate(final_features[:20]):
-        print(f"{i+1}. {feature}")
-    
-    # Optional: Retrain the model with only the selected features
-    retrain = input("\nDo you want to retrain the model with only the selected features? (y/n): ")
-    if retrain.lower() == 'y':
-        new_model, history = retrain_with_selected_features(
-            X, y_one_hot, final_features, "synthetic_dataset_model.keras"
-        )
-        
-        print("\nFeature selection and model retraining complete!")
-        print("Check the 'shap_plots' directory for feature importance visualizations")
-        print("Check 'selected_features.csv' for the list of selected features")
-        print("Check 'feature_importance.csv' for detailed feature importance scores")
-    else:
-        print("\nFeature selection complete without retraining!")
-        print("Check the 'shap_plots' directory for feature importance visualizations")
-        print("Check 'selected_features.csv' for the list of selected features")
-        print("Check 'feature_importance.csv' for detailed feature importance scores")
-
-if __name__ == "__main__":
-    main() 

@@ -22,9 +22,9 @@ def parse_arguments():
                         help='Whether to retrain the model with selected features')
     parser.add_argument('--manual', action='store_true',
                         help='Use manual implementation of Boruta algorithm')
-    parser.add_argument('--iterations', type=int, default=100,
+    parser.add_argument('--iterations', type=int, default=5,
                         help='Number of iterations for manual Boruta')
-    parser.add_argument('--sample', type=int, default=2000,
+    parser.add_argument('--sample', type=int, default=1000,
                         help='Number of samples to use for SHAP calculations (larger = slower)')
     return parser.parse_args()
 
