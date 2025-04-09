@@ -1,3 +1,17 @@
+"""
+Branch Classification Model
+-------------------------
+This script implements a machine learning pipeline for classifying business branches using XGBoost.
+The model uses a hierarchical approach, first predicting level 1 classifications, then using those
+predictions to help predict level 4 (most detailed) classifications.
+
+Key Features:
+- Hierarchical classification (level 1 -> level 4)
+- Data balancing using RandomUnderSampler
+- Feature engineering including ratio calculations
+- K-nearest centroids computation
+- Cross-validation using folds
+"""
 # Imports
 from sqlalchemy import create_engine
 import matplotlib.pyplot as plt
@@ -12,7 +26,6 @@ import numpy as np
 import random
 
 from scipy.sparse import csr_matrix
-
 from sklearn.metrics import (
     accuracy_score, 
     precision_score, 
@@ -24,38 +37,38 @@ from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
 )
-from sklearn.metrics.pairwise import (
-    manhattan_distances,
-)
-
+from sklearn.metrics.pairwise import manhattan_distances
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import (
-    LabelEncoder,
-     StandardScaler,
-)
-
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 import xgboost as xgb
 from imblearn.under_sampling import RandomUnderSampler
-import shap
 
-# Constant
-folds_size = 2
-seed = 3
-up_limit = 1200
-sub_pop = 3
-flag_words = True
-how_df_words = 'inner'
-k = 8
-label = 'MST_ANAF_A'
-n_features = 900
-min_companies = 20
-n_cpus = -1
+# Model configuration parameters
+flag_train = True       # Wherher to predict on all companies
+flag_predict_all = True # Wherher to predict on all companies
+flag_full = False       # Run model with transformationa and centers
+folds_size = 2          # Number of cross-validation folds
+seed = 3                # Random seed for reproducibility 
+up_limit = 1200         # Maximum samples per class after balancing
+sub_pop = 3             # Subpopulation selection criteria
+flag_words = True       # Whether to use text features
+how_df_words = 'inner'  # Join type for text features
+k = 8                   # Number of nearest centroids to compute
+feature_secondary = 'lv1_predicted' # Temporary feature of the first model
+label = 'MST_ANAF_A'    # Target variable column name
+label_transform = 'anaf_transform' # Target for inference
+n_features = 900        # Number of features to use
+min_companies = 20      # Minimum companies per class
+n_cpus = -1             # Number of CPU cores (-1 for all)
+
+# Model version tracking
 version_model = 'v3'
 version_model_output = version_model + '_6'
 kpis_model_version =  version_model_output + f'_{n_features}_{sub_pop}_{up_limit}_{min_companies}_{folds_size}_{k}_{flag_words * 1}_{how_df_words}'
 prediction_table_name = 'branch_prediction_2022_' + version_model_output
 importance_table_name = 'branch_features_important_2022_' + version_model
 
+# XGBoost parameters
 param = {
     "n_estimators": 500,
     "max_depth": 3,
@@ -67,14 +80,18 @@ param = {
     'n_jobs': n_cpus,
 }
 
+# Set random seeds for reproducibility
 np.random.seed(seed)
 random.seed(seed)
 
+
 def print_time(str_time, gap_time):
+    """Helper function to print elapsed time with message"""
     print(f'{str_time}, time {gap_time:.2f}')
 
 
 def split_it(llm_output):
+    """Split text into words, handling None values"""
     if llm_output:
         return re.findall(r"[\w']+", llm_output)
     return []
@@ -82,171 +99,175 @@ def split_it(llm_output):
 
 def masked_cosine_similarity_df(records_df, centroids_df):
     """
-    Compute masked cosine similarities between two DataFrames efficiently using sparse matrices.
-
-    Parameters:
-    - records_df: pd.DataFrame
-        DataFrame where each row is a record.
-    - centroids_df: pd.DataFrame
-        DataFrame where each row is a centroid.
-
-    Returns:
-    - similarities: pd.DataFrame
-        A DataFrame where each entry (i, j) is the similarity from record i to centroid j.
+    Compute manhattan distances between records and centroids, handling missing values.
+    Returns distance matrix between records and centroids.
     """
-    # Ensure the two dataframes have the same columns
-    assert len(records_df.columns) == len(centroids_df.columns), "Columns of records_df and centroids_df must match"
-
-    # Replace NaN with 0 (sparse representation) and mask NaN separately
+    assert len(records_df.columns) == len(centroids_df.columns), "Columns must match"
+    
     records_array = records_df.fillna(0).to_numpy()
     centroids_array = centroids_df.fillna(0).to_numpy()
-
     records_mask = ~records_df.isna().to_numpy()
     centroids_mask = ~centroids_df.isna().to_numpy()
-
-    # Apply masks
-    # records_sparse = csr_matrix(records_array * records_mask)
-    # centroids_sparse = csr_matrix(centroids_array * centroids_mask)
+    
     records_sparse = records_array * records_mask
     centroids_sparse = centroids_array * centroids_mask
-
-    # Compute cosine similarities using sparse matrix operations
-    similarities_sparse = manhattan_distances(records_sparse, centroids_sparse)
-
-    return similarities_sparse
+    
+    return manhattan_distances(records_sparse, centroids_sparse)
 
 
 def sampling_lmblearn(X, y, up_limit, random_state):
     """
-    Balance class distribution by undersampling using imbalanced-learn's RandomUnderSampler.
-    Args:
-        X (DataFrame): Feature data.
-        y (Series): Target labels.
-        up_limit (int): Maximum samples per class after undersampling.
-        clf__random_state (int): Random state for reproducibility.
-    Returns:
-        DataFrame, Series: Resampled feature set and target labels.
+    Balance class distribution by undersampling majority classes to up_limit samples.
+    Returns balanced X and y datasets.
     """
     categories_count = y.value_counts()
     target_samples = {k: up_limit for k, _ in categories_count[categories_count > up_limit].to_dict().items() if k in y}
     rus = RandomUnderSampler(sampling_strategy=target_samples, random_state=random_state)
-    X_res, y_res = rus.fit_resample(X, y)
-    return X_res, y_res  # Return resampled features and labels
+    return rus.fit_resample(X, y)
 
 
 def metrics_kpis(real_values, pred_values):
-    time       = datetime.now()
-    Accuracy   = round(accuracy_score(real_values,pred_values), 4)
-    Precision  = round(precision_score(real_values,pred_values, average='macro'), 4)
-    Recall     = round(recall_score(real_values,pred_values, average='macro'), 4)
-    F1         = round(f1_score(real_values,pred_values, average='macro'), 4)
-    MCC        = round(matthews_corrcoef(real_values,pred_values) ,4)
-    Prec_Avg   = round(average_precision_score(real_values,pred_values), 4)
-    Accu_Avg   = round(balanced_accuracy_score(real_values,pred_values), 4)
-    return [time, Accuracy, Precision, Recall, F1, MCC, Prec_Avg, Accu_Avg]
+    """Calculate and return multiple classification metrics"""
+    time = datetime.now()
+    return [
+        time,
+        round(accuracy_score(real_values, pred_values), 4),
+        round(precision_score(real_values, pred_values, average='macro'), 4),
+        round(recall_score(real_values, pred_values, average='macro'), 4),
+        round(f1_score(real_values, pred_values, average='macro'), 4),
+        round(matthews_corrcoef(real_values, pred_values), 4),
+        round(average_precision_score(real_values, pred_values), 4),
+        round(balanced_accuracy_score(real_values, pred_values), 4)
+    ]
 
 
 def create_connection():
+    """Create and return SQL database connection"""
     servername = 'bisqldwhd1'
     dbname = 'SRC_MCH'
-    engine = create_engine(f'mssql+pyodbc://@{servername}/{dbname}?trusted_connection=yes&driver=ODBC+Driver+17+for+SQL+Server')
-    return engine
+    return create_engine(f'mssql+pyodbc://@{servername}/{dbname}?trusted_connection=yes&driver=ODBC+Driver+17+for+SQL+Server')
 
 
 def load_data(engine, version_model):
+    """Load base feature data from database"""
     start = time.time()
     df = pd.read_sql_table(
         "branch_features_panel_2022_" + version_model,
         schema="dbo",
         con=engine,
-    ).sample(5000)
-    # ).sample(frac=1)
+    ).sample(frac=1)
     end = time.time()
     print_time(' load data feature panel', end - start)
     return df
 
 
 def load_words(engine, version_model, df):
+    """Load and process text features if enabled"""
     start = time.time()
     df_words = pd.read_sql_table(
         "branch_llm_branch_2022_" + version_model,
         schema="dbo",
         con=engine,
     )
-
+    
+    # Process text into word columns
     df_words['words'] = df_words.branch_llm.apply(split_it)
     df_words['words'] = df_words['words'].apply(lambda d: d if isinstance(d, list) else [])
-
     df_words = pd.DataFrame(df_words.words.values.tolist(), df_words.tik).add_prefix('word_')
+    
+    # Limit word columns and merge with main dataframe
     if len(list(df_words)) > 4:
         df_words.drop(columns=[f'word_{i}' for i in range(4, len(list(df_words)))], inplace=True)
-
     words_columns = list(df_words)
-    df_words = df_words.replace('\n', '')
-    df_words = df_words.astype('category')
+    df_words = df_words.replace('\n', '').astype('category')
     df_words.reset_index(inplace=True)
-
     df = df.merge(df_words, on='tik', how=how_df_words)
+    
     end = time.time()
     print_time(f' words n records {len(df_words)}', end - start)
     return df, words_columns
 
 
 def fillter_data(sub_pop, engine, version_model, df):
+    """Apply filtering based on subpopulation criteria"""
     start = time.time()
+    
+    # Different filtering logic based on sub_pop value
     if sub_pop == 1:
         final_df = pd.read_sql_table(
             "branch_prediction_2022_" + version_model,
             schema="dbo",
             con=engine,
         )
-
         final_df['hit'] = (final_df[label] == final_df.best_anaf) * 1
-
         subpopulation = (final_df[[label, 'hit']].groupby([label]).sum() / 
-                                final_df[[label, 'hit']].groupby([label]).count()).reset_index()
-
+                        final_df[[label, 'hit']].groupby([label]).count()).reset_index()
         sub_pupolation = subpopulation.sort_values(by=['hit']).loc[subpopulation.hit > 0.1, label].values.tolist()
         df = df[(df.same_anaf == 1) & (df.MST_ANAF_A.isin(sub_pupolation))].reset_index(drop=True)
-
         del final_df
         print(f'sub pop {len(sub_pupolation)}')
     elif sub_pop == 2:
         df = df[(df.has_clients_features == 0) & (df.has_suppliers_features == 0)].reset_index(drop=True)
     elif sub_pop == 3:
         df = df[(df.same_anaf == 1)].reset_index(drop=True)
+    elif sub_pop == 4:
+        pass
     else:
         df = df[(df.same_anaf == 1) & (df.MST_ANAF_A != 7020.0)].reset_index(drop=True)
 
+    # Filter out classes with too few samples
     categories = df[label].value_counts()
     df = df[df[label].isin(categories[categories > min_companies].index)].reset_index(drop=True)
+    
     end = time.time()
     print_time(f' n records {len(df)}, n classes {df[label].nunique()}', end - start)
     return df
 
 
-def encoding_data(df, words_columns):
+def encoding_data(df, words_columns, le, flag_predict):
+    """Transform data types and encode categorical variables"""
     start = time.time()
-    le = LabelEncoder()
-    df[label] = le.fit_transform(df[label])
 
-    df = df.drop(['MST_D_HACHNASA_ESEK_R',
-                    'MST_D_HACHNASA_SACAR_R', 'MST_D_HACHNASA_SACAR_BZ', 
-                    'MST_MAAM_R', 'MST_KNAS_GERAON', 'MST_HACHNASOT_ESEK_R', 'MST_MAS_MEGIA_R',
-                    'MST_NIKUI_MAKOR_SACHAR', 'MST_ITRAT_ZIK_R', 'doh_anaf', 'MST_HACHNASA_SACAR_R', 
-                    'same_anaf'], axis=1)
-                    # 'DOH_MIS_OSEK',
+    drop_features = ['MST_D_HACHNASA_ESEK_R',
+                    'MST_D_HACHNASA_SACAR_R', 
+                    'MST_D_HACHNASA_SACAR_BZ', 
+                    'MST_MAAM_R', 
+                    'MST_KNAS_GERAON', 
+                    'MST_HACHNASOT_ESEK_R', 
+                    'MST_MAS_MEGIA_R',
+                    'MST_NIKUI_MAKOR_SACHAR', 
+                    'MST_ITRAT_ZIK_R', 
+                    'doh_anaf', 
+                    'MST_HACHNASA_SACAR_R', 
+                    'same_anaf']
+    
+    categories_satelments = ['KOD_DOAAR_CHOZER',
+                        'YSHUV',
+                        'YSHUV_ESEK',
+                        'YSHUV_PRATI',]
+    
+    if not flag_full:
+        drop_features += categories_satelments
 
+    # Encode target variable
+    if flag_predict:
+        unknown = le.transform(np.array([7020.0]))[0]
+        le_dict = dict(zip(le.classes_, le.transform(le.classes_)))
+        df[label_transform] = df[label].apply(lambda x: le_dict.get(x, unknown))
+    else:
+        le = LabelEncoder()
+        df[label] = le.fit_transform(df[label])
+
+    # Remove specific financial columns that aren't needed for modeling
+    df = df.drop(drop_features, axis=1)
+
+    # Remove columns with only one unique value
     for col in df.columns:
         if len(df[col].unique()) == 1:
             df.drop(col, inplace=True, axis=1)
 
-    # Categorical list
-    categorical_list_tmp = ['KOD_DOAAR_CHOZER',
-                        'YSHUV',
-                        'YSHUV_ESEK',
-                        'YSHUV_PRATI',
-                        'has_suppliers_features',
+    # Define categorical columns
+    categorical_list_tmp = ['has_suppliers_features',
                         'anaf_negdi_1_by_schum',
                         'anaf_negdi_2_by_schum',
                         'anaf_negdi_3_by_schum',
@@ -289,17 +310,17 @@ def encoding_data(df, words_columns):
                         'SHEM_LOAZI',
                         'SHEM_MALE_KODEM',
                         'prt_shem_tik'
-                        ] 
-                        
+                        ]  
+    
+    # Add word columns to categorical list if text features are enabled
     if flag_words:
         categorical_list_tmp += words_columns
 
-    categorical_list = []
-    for col in categorical_list_tmp:
-        if col in df.columns:
-            categorical_list.append(col)        
-               
-    remove_cols_tmp = ['tik',
+    # Filter categorical list to only include columns present in dataframe
+    categorical_list = [col for col in categorical_list_tmp if col in df.columns]
+    
+    # Define columns to remove
+    remove_cols = [col for col in ['tik',
                     label,
                     'mst_anaf_lvl4_desc',
                     'mst_anaf_lvl3',
@@ -313,33 +334,24 @@ def encoding_data(df, words_columns):
                     'SHEM_MALE_KODEM',
                     'prt_shem_tik',
                     'mam_melel_anaf',
-                    'matara',]
+                    'matara',] if col in df.columns]
 
-    remove_cols = []
-    for col in remove_cols_tmp:
-        if col in df.columns:
-            remove_cols.append(col)     
+    if flag_predict:
+        remove_cols += [label_transform]
 
+    # Define continuous columns to remove
+    remove_continuos = [col for col in ['hevrot_y_rishum', 'PRT_SM_ST'] 
+                       if col in df.columns]
 
-    remove_continuos_tmp = ['hevrot_y_rishum',
-                        'PRT_SM_ST',
-                        ]
-
-    remove_continuos = []
-    for col in remove_continuos_tmp:
-        if col in df.columns:
-            remove_continuos.append(col)   
-
+    # Convert categorical columns
     df[categorical_list] = df[categorical_list].astype('category')
 
+    # Get list of numeric columns
     numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
     numeric_list = df.select_dtypes(include=numerics).columns.tolist()
 
-    for col in remove_cols:
-        if col in numeric_list:
-            numeric_list.remove(col)
-
-    for col in remove_continuos:
+    # Remove specified columns from numeric list
+    for col in remove_cols + remove_continuos:
         if col in numeric_list:
             numeric_list.remove(col)
 
@@ -349,8 +361,10 @@ def encoding_data(df, words_columns):
 
 
 def transforamtion(engine, df, numeric_list, words_columns, remove_cols):
+    """Create ratio features and apply feature selection"""
     start = time.time()
-    # Transformation
+    
+    # Create ratio features between all numeric columns
     series_list = []
     cols_iteration_list = []
     for i, a in enumerate(numeric_list[:-1]):
@@ -359,35 +373,33 @@ def transforamtion(engine, df, numeric_list, words_columns, remove_cols):
                 cols_iteration_list.append(a + '|' + b)
                 series_list.append(df[a] / df[b])
 
+    # Combine ratio features with original dataframe
     iteation_df = pd.concat(series_list, axis=1)
     iteation_df.columns = cols_iteration_list
-
     df = pd.concat([df, iteation_df], axis=1)
     df = df.rename(str, axis="columns")
+    
+    # Handle infinite values
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
     numeric_list += cols_iteration_list
 
+    # Apply feature selection if n_features is specified
     if n_features:
+        # Load feature importance rankings
         xgb_fea_imp = pd.read_sql_table(importance_table_name,
                         engine, schema="dbo")    
         
+        # Select top n_features plus word features if enabled
         selected_features = xgb_fea_imp.feature.head(n_features).values.tolist()
         if flag_words:
             selected_features += words_columns
 
-        columns_list_tmp = list(df)
-        columns_list = []
-        for col in columns_list_tmp:
-            if col in selected_features:
-                columns_list.append(col)
+        # Filter columns based on selected features
+        columns_list = [col for col in df.columns if col in selected_features]
         df = df[remove_cols + columns_list]
 
-        numeric_list_tmp = numeric_list.copy()
-        numeric_list = []
-        for col in columns_list:
-            if col in numeric_list_tmp:
-                numeric_list.append(col)
+        # Update numeric list to only include selected features
+        numeric_list = [col for col in columns_list if col in numeric_list]
 
     end = time.time()
     print_time(f' n columns numeric {len(numeric_list)}', end - start)
@@ -395,20 +407,36 @@ def transforamtion(engine, df, numeric_list, words_columns, remove_cols):
 
 
 def create_centers(df, numeric_list):
+    """Create centroid-based features using standardized numeric data"""
     start = time.time()
-    # Add centers
+    
+    # Standardize numeric features
     scaler = StandardScaler()
     df[numeric_list] = scaler.fit_transform(df[numeric_list])
 
+    # Calculate class centroids and standard deviations
     df_group_mean = df[numeric_list + [label]].groupby(label).mean()
     df_group_std = df[numeric_list + [label]].groupby(label).std()
-
     df_group_mean.columns = [col + '_mean' for col in numeric_list]
     df_group_std.columns = [col + '_std' for col in numeric_list]
 
+    df_group_mean.to_csv(f'centers_{kpis_model_version}.csv', index=False)
+    end = time.time()
+    print_time(' created centers', end - start)
+    return df_group_mean
+
+
+def calculate_distance(df, df_group_mean, numeric_list):
+    start = time.time()
+    # Standardize numeric features
+    scaler = StandardScaler()
+    df[numeric_list] = scaler.fit_transform(df[numeric_list])
+
+    # Calculate distances to centroids and find k nearest
     distance = masked_cosine_similarity_df(df[numeric_list], df_group_mean)
     ind = np.argpartition(distance, k, axis=1)[:, :k]
 
+    # Create centroid features
     series_list = []
     cols_iteration_list = []
     for a in range(k):
@@ -418,6 +446,7 @@ def create_centers(df, numeric_list):
     iteation_df = pd.concat(series_list, axis=1)
     iteation_df.columns = cols_iteration_list
 
+    # Add centroid features to dataframe
     df = pd.concat([df, iteation_df], axis=1)
     df = df.rename(str, axis="columns")
     df[cols_iteration_list] = df[cols_iteration_list].astype('category')
@@ -428,70 +457,97 @@ def create_centers(df, numeric_list):
 
 
 def create_folds(df):
-    # Create folds
+    """Create random cross-validation folds"""
+    # Generate random fold assignments
     folds = np.random.randint(low=0, high=folds_size, size=len(df))
 
+    # Save fold assignments for reproducibility
     folds_dict = {'folds': folds.tolist()}
     with open('folds.json', 'w') as f:
         json.dump(folds_dict, f)
 
-    # with open('folds.json', 'r') as f:
-    #     folds = np.array(json.load(f)['folds'])
     return folds
 
 
-def run_model(df, remove_cols, level, folds_size, folds, previous_df_k_fold_results):
+def run_model(df, remove_cols, level, folds_size, folds, le, previous_df_k_fold_results):
+    """
+    Train and evaluate model for a specific hierarchical level.
+    
+    Args:
+        df: Input dataframe
+        remove_cols: Columns to exclude
+        level: Hierarchical level ('lv1' or 'lv4')
+        folds_size: Number of cross-validation folds
+        folds: Fold assignments
+        previous_df_k_fold_results: Results from previous level model
+    """
     start_first = time.time()
-    #  'mst_anaf_lvl3',
-    #  'mst_anaf_lvl2',
-    #  'mst_anaf_lvl1',
-    label_Secondery = 'mst_anaf_lvl1'
+    label_secondery = 'mst_anaf_lvl1'
+    
+    # For level 1, encode secondary label
     if level == 'lv1':
         le_lv1 = LabelEncoder()
-        df[label_Secondery + '_encoded'] = le_lv1.fit_transform(df[label_Secondery])
+        df[label_secondery + '_encoded'] = le_lv1.fit_transform(df[label_secondery])
 
+    # Initialize results tracking
     results = []
-    df_k_fold_results = {'train': [],
-                        'test': [],
-                        'x_test': [],
-                        'y_test': [],
-                        'model': [],
-                        }
+    df_k_fold_results = {
+        'train': [],
+        'test': [],
+        'x_test': [],
+        'y_test': [],
+        'model': [],
+    }
                         
+    # Train and evaluate model for each fold
     for fold in range(folds_size):
         start = time.time()
         print(f' {level} fold {fold}')
+        
+        # Split data into train and test
         train = df.loc[folds != fold, :].reset_index(drop=True)
         test = df.loc[folds == fold, :].reset_index(drop=True)
+        
+        # Prepare features and target based on level
         if level == 'lv1':
-            y_train, y_test = train[[label_Secondery + '_encoded']], test[[label_Secondery + '_encoded']]
+            y_train, y_test = train[[label_secondery + '_encoded']], test[[label_secondery + '_encoded']]
             x_train, x_test = train.drop(remove_cols + 
-                        [label_Secondery + '_encoded'], axis=1), test.drop(remove_cols + 
-                        [label_Secondery + '_encoded'], axis=1)
+                        [label_secondery + '_encoded'], axis=1), test.drop(remove_cols + 
+                        [label_secondery + '_encoded'], axis=1)
         else:
             y_train, y_test = train[[label]], test[[label]]
             x_train, x_test = train.drop(remove_cols + 
-                    [label_Secondery + '_encoded'], axis=1), test.drop(remove_cols + 
-                    [label_Secondery + '_encoded'], axis=1)
-            x_train[f'{level}_predicted'] = previous_df_k_fold_results['model'][fold].predict(x_train)
-            x_test[f'{level}_predicted'] = previous_df_k_fold_results['model'][fold].predict(x_test)
+                    [label_secondery + '_encoded'], axis=1), test.drop(remove_cols + 
+                    [label_secondery + '_encoded'], axis=1)
+            # Add predictions from previous level as features
+            x_train[feature_secondary] = previous_df_k_fold_results['model'][fold].predict(x_train)
+            x_test[feature_secondary] = previous_df_k_fold_results['model'][fold].predict(x_test)
 
+        # Balance classes and train model
         x_train, y_train = sampling_lmblearn(x_train, y_train, up_limit, seed)
-
         model = xgb.XGBClassifier(**param)
         model.fit(x_train, y_train)
+        
+        # Evaluate model
         y_predict = model.predict(x_test)
-
         accuracy = accuracy_score(y_test, y_predict)
         results.append(accuracy)
 
+        # Store results
         df_k_fold_results['train'].append(train['tik'])
         df_k_fold_results['test'].append(test[remove_cols])
         df_k_fold_results['x_test'].append(x_test)
         df_k_fold_results['y_test'].append(y_test)
         df_k_fold_results['model'].append(model)
+        
         end = time.time()
         print_time(f'  {level} accuracy {accuracy:.2f}', end - start)
+
+    # Save model metadata
+    if level == 'lv4':
+        df_k_fold_results['le'] = le
+    with open(f"metadata_{level}_{kpis_model_version}.pkl", "wb") as f:
+        cloudpickle.dump(df_k_fold_results, f)
 
     end = time.time()
     print_time(f' {level} mean accuracy {np.mean(results):.2f}', end - start_first)  
@@ -499,139 +555,321 @@ def run_model(df, remove_cols, level, folds_size, folds, previous_df_k_fold_resu
 
 
 def importance_features(df_k_fold_results, engine, version_model):
+    """Calculate and store feature importance scores"""
     start = time.time()
+    
+    # Get feature importance from first fold's model
     model = df_k_fold_results['model'][0]
-    xgb_fea_imp = pd.DataFrame(list(model.get_booster().get_fscore().items()),
-                    columns=['feature','importance']).sort_values('importance', ascending=False).reset_index(drop=True)
-    xgb_fea_imp.to_sql('branch_features_important_2022_' + version_model,
-                    engine, schema="dbo", 
-                        if_exists='replace',
-                        index=False)  
+    xgb_fea_imp = pd.DataFrame(
+        list(model.get_booster().get_fscore().items()),
+        columns=['feature','importance']
+    ).sort_values('importance', ascending=False).reset_index(drop=True)
+    
+    # Store feature importance in database
+    xgb_fea_imp.to_sql(
+        'branch_features_important_2022_' + version_model,
+        engine, schema="dbo", 
+        if_exists='replace',
+        index=False
+    )  
+    
     end = time.time()
     print_time(' importance', end - start)
 
 
 def infernce_final_df(df_k_fold_results, le, remove_cols):
+    """Generate final predictions and probabilities for all folds"""
     start = time.time()
     list_dfs = []
+    
+    # Process each fold
     for fold in range(folds_size):
         print(f' fold {fold}')
+        # Get prediction probabilities
         prob = df_k_fold_results['model'][fold].predict_proba(df_k_fold_results['x_test'][fold])
+        
+        # Get probability for current class and best class
         current_prob = pd.Series(prob[np.arange(prob.shape[0]),
                             [a[0] for a in df_k_fold_results['y_test'][fold].values.tolist()]])
         best_branch = np.argmax(prob, axis=1)
-        best_prob =  pd.Series(prob[np.arange(prob.shape[0]), best_branch])
-        list_dfs.append(pd.concat([df_k_fold_results['test'][fold][remove_cols], 
-                                    current_prob, pd.Series(le.inverse_transform(best_branch)),
-                                    best_prob], axis=1))
+        best_prob = pd.Series(prob[np.arange(prob.shape[0]), best_branch])
+        
+        # Combine results
+        list_dfs.append(pd.concat([
+            df_k_fold_results['test'][fold][remove_cols], 
+            current_prob, 
+            pd.Series(le.inverse_transform(best_branch)),
+            best_prob
+        ], axis=1))
 
-        final_df = pd.concat(list_dfs, axis=0, ignore_index=True)
-        final_df.columns = remove_cols + ['current_anaf_prob', 'best_anaf', 'best_anaf_prob']
-        final_df[label] = le.inverse_transform(final_df[label])
-
-    df_k_fold_results['le'] = le
-    with open(f"metadata_{kpis_model_version}.pkl", "wb") as f:
-            cloudpickle.dump(df_k_fold_results, f)
+    # Combine results from all folds
+    final_df = pd.concat(list_dfs, axis=0, ignore_index=True)
+    final_df.columns = remove_cols + ['current_anaf_prob', 'best_anaf', 'best_anaf_prob']
+    final_df[label] = le.inverse_transform(final_df[label])
+            
     end = time.time()
     print_time(' infernce final df', end - start)
     return final_df
 
 
 def infernce(engine, version_model, prediction_table_name, final_df):
+    """Add branch hierarchy information and calculate distances between predictions"""
     start = time.time()
+    
+    # Load branch hierarchy data
     anaf_df = pd.read_sql_table(
         "branch_features_panel_2022_" + version_model,
         schema="dbo",
         con=engine,
     )
 
+    # Get unique branch hierarchies
     anaf_unique_df = anaf_df[[
-                        'mst_anaf_lvl1',
-                        'mst_anaf_lvl1_desc',
-                        'mst_anaf_lvl2',
-                        'mst_anaf_lvl2_desc',
-                        'mst_anaf_lvl3',
-                        'mst_anaf_lvl3_desc',
-                        label,
-                        'mst_anaf_lvl4_desc',
-                        ]].drop_duplicates()
+        'mst_anaf_lvl1',
+        'mst_anaf_lvl1_desc',
+        'mst_anaf_lvl2',
+        'mst_anaf_lvl2_desc',
+        'mst_anaf_lvl3',
+        'mst_anaf_lvl3_desc',
+        label,
+        'mst_anaf_lvl4_desc',
+    ]].drop_duplicates()
 
-    anaf_unique_df_best = anaf_unique_df.rename(columns={label: 'best_anaf',
-                                                'mst_anaf_lvl4_desc': 'mst_anaf_lvl4_desc_best',
-                                                'mst_anaf_lvl3': 'mst_anaf_lvl3_best',
-                                                'mst_anaf_lvl3_desc': 'mst_anaf_lvl3_desc_best',
-                                                'mst_anaf_lvl2': 'mst_anaf_lvl2_best',
-                                                'mst_anaf_lvl2_desc': 'mst_anaf_lvl2_desc_best',
-                                                'mst_anaf_lvl1': 'mst_anaf_lvl1_best',
-                                                'mst_anaf_lvl1_desc': 'mst_anaf_lvl1_desc_best'})
+    # Rename columns for predicted branch
+    anaf_unique_df_best = anaf_unique_df.rename(columns={
+        label: 'best_anaf',
+        'mst_anaf_lvl4_desc': 'mst_anaf_lvl4_desc_best',
+        'mst_anaf_lvl3': 'mst_anaf_lvl3_best',
+        'mst_anaf_lvl3_desc': 'mst_anaf_lvl3_desc_best',
+        'mst_anaf_lvl2': 'mst_anaf_lvl2_best',
+        'mst_anaf_lvl2_desc': 'mst_anaf_lvl2_desc_best',
+        'mst_anaf_lvl1': 'mst_anaf_lvl1_best',
+        'mst_anaf_lvl1_desc': 'mst_anaf_lvl1_desc_best'
+    })
 
+    # Merge predictions with hierarchy information
     final_df = final_df.merge(anaf_unique_df_best, on='best_anaf', how='inner')
-
     final_df[['mst_anaf_lvl2', 'mst_anaf_lvl3']] = final_df[['mst_anaf_lvl2', 
                                                     'mst_anaf_lvl3']].astype(float)
 
+    # Calculate hierarchical distance between actual and predicted branches
     final_df['distance_between_predictions'] = (10 - ((final_df.mst_anaf_lvl1 == final_df.mst_anaf_lvl1_best) * 1 +
                                                     (final_df.mst_anaf_lvl2 == final_df.mst_anaf_lvl2_best) * 2 +
                                                     (final_df.mst_anaf_lvl3 == final_df.mst_anaf_lvl3_best) * 3 +
                                                     (final_df[label] == final_df.best_anaf) * 4)) / 10
 
+    # Store final results
     final_df.to_sql(prediction_table_name, 
                     engine, schema="dbo", 
                     if_exists='replace',
                     index=False)
+                    
     end = time.time()
     print_time(' infernce predictions', end - start)
     return final_df, anaf_df
 
 
 def infernce_kpis(engine, final_df, anaf_df):
+    """Calculate and store model performance metrics"""
     start = time.time()
-    print(f' level 1 {accuracy_score(final_df.mst_anaf_lvl1.values, final_df.mst_anaf_lvl1_best.values):.2f}')
-    print(f' level 2 {accuracy_score(final_df.mst_anaf_lvl2.values, final_df.mst_anaf_lvl2_best.values):.2f}')
-    print(f' level 3 {accuracy_score(final_df.mst_anaf_lvl3.values, final_df.mst_anaf_lvl3_best.values):.2f}')
-    print(f' level 4 {accuracy_score(final_df[label].values, final_df.best_anaf.values):.2f}')
+    
+    # Print accuracy for each hierarchical level
+    print(f'  level 1 {accuracy_score(final_df.mst_anaf_lvl1.values, final_df.mst_anaf_lvl1_best.values):.2f}')
+    print(f'  level 2 {accuracy_score(final_df.mst_anaf_lvl2.values, final_df.mst_anaf_lvl2_best.values):.2f}')
+    print(f'  level 3 {accuracy_score(final_df.mst_anaf_lvl3.values, final_df.mst_anaf_lvl3_best.values):.2f}')
+    print(f'  level 4 {accuracy_score(final_df[label].values, final_df.best_anaf.values):.2f}')
 
+    # Calculate detailed metrics
     kpis_results = metrics_kpis(final_df[label].values.reshape(-1, 1), final_df.best_anaf.values.reshape(-1, 1))
 
-    pd.DataFrame([kpis_results + [round(len(final_df) / len(anaf_df), 2)] + [kpis_model_version]], columns=['time', 
-                                        'Accuracy', 
-                                        'Precision', 
-                                        'Recall', 
-                                        'F1', 
-                                        'MCC', 
-                                        'Precision_Avg', 
-                                        'Accuracy_Avg',
-                                        'Coverage',
-                                        'version']).to_sql('branch_kpis_2022_v1', 
-                    engine, schema="dbo", 
-                    if_exists='append',
-                    index=False)
+    # Store metrics in database
+    pd.DataFrame([kpis_results + [round(len(final_df) / len(anaf_df), 2)] + [kpis_model_version]], 
+                columns=['time', 
+                        'Accuracy', 
+                        'Precision', 
+                        'Recall', 
+                        'F1', 
+                        'MCC', 
+                        'Precision_Avg', 
+                        'Accuracy_Avg',
+                        'Coverage',
+                        'version']).to_sql('branch_kpis_2022_v1', 
+                                         engine, schema="dbo", 
+                                         if_exists='append',
+                                         index=False)
+                                         
     end = time.time()
     print_time(' infernce kpis', end - start)
 
 
-def main():
+# Function to perform inference on all companies
+def inference_on_all_companies(df, df_k_fold_results, df_k_fold_results_lv1, le, remove_cols):
+    start = time.time()  # Record the start time for performance measurement
+    
+    # Create a list to hold the IDs from the training data of all folds
+    tik_ids = []
+    for fold in df_k_fold_results['train']:
+        tik_ids += fold.values.tolist()
+
+    list_dfs = []  # List to store the result DataFrames for each fold
+
+    # Iterate over each fold to perform predictions
+    for fold in range(folds_size):  # `folds_size` is assumed to be defined elsewhere
+        print(f' fold {fold}')  # Print the current fold number
+        
+        # Prepare training data by excluding the IDs in `tik_ids`
+        train = df.loc[~df.tik.isin(tik_ids), :].reset_index(drop=True)
+        
+        # Split the training data into labels (y_train) and features (x_train)
+        y_train = train[[label_transform]]  # Assuming `label_transform` is defined elsewhere
+        x_train = train.drop(remove_cols, axis=1)  # Drop unnecessary columns from the feature set
+
+        # Make predictions for the level-1 model using the features
+        x_train[feature_secondary] = df_k_fold_results_lv1['model'][fold].predict(x_train)
+
+        # Calculate class probabilities for the current fold's model
+        prob = df_k_fold_results['model'][fold].predict_proba(x_train)
+        
+        # Get the predicted probability for the true label in the training data
+        current_prob = pd.Series(prob[np.arange(prob.shape[0]), [a[0] for a in y_train.values.tolist()]])
+        
+        # Get the class with the highest probability for each sample
+        best_branch = np.argmax(prob, axis=1)
+        best_prob = pd.Series(prob[np.arange(prob.shape[0]), best_branch])
+        
+        # Create a temporary DataFrame with the relevant columns
+        tmp_df = pd.concat([train[remove_cols], 
+                            current_prob, 
+                            pd.Series(le.inverse_transform(best_branch)),
+                            best_prob], axis=1)
+        
+        # Rename columns for clarity
+        tmp_df.columns = remove_cols + ['current_anaf_prob', 'best_anaf', 'best_anaf_prob']
+        
+        # Drop the original label column (since it's no longer needed)
+        tmp_df.drop(columns=[label_transform], inplace=True)
+        
+        # Append this fold's DataFrame to the list
+        list_dfs.append(tmp_df)
+
+    # Collect the column names for the final DataFrame
+    col_names = list(list_dfs[0])
+
+    # Initialize variable to track the maximum number of rows in any fold's DataFrame
+    max_dfs = max([len(tmp) for tmp in list_dfs])
+
+    rows = []  # List to store the rows of the final DataFrame
+
+    # For each row index, find the row with the best prediction across all folds
+    for i in range(max_dfs):
+        # Get the fold with the highest "best_anaf_prob" value for the current row index
+        max_current = np.argmax([tmp.loc[i, 'best_anaf_prob'] 
+                                if i < len(tmp) else -np.inf for tmp in list_dfs])
+        # Append the best prediction probability for this row
+        rows.append(list_dfs[max_current].loc[i, :].values)
+
+    end = time.time()  # Record the end time
+    print_time(' prediction on all companies', end - start)  # Print the time taken for the prediction
+
+    # Return the final DataFrame with the best prediction probabilities
+    return pd.DataFrame(rows, columns=col_names)
+
+
+# Function to push the predictions to a database table
+def push_table(engine, df):
+    start = time.time()  # Record the start time for performance measurement
+    
+    # Load the existing table from the database into a DataFrame
+    final_df = pd.read_sql_table(prediction_table_name, engine, schema="dbo")
+    
+    # Concatenate the existing data with the new predictions
+    all_df = pd.concat([final_df, df], axis=0, ignore_index=True)
+
+    # Write the combined data back to the database
+    all_df.to_sql(prediction_table_name + '_all', 
+                  engine, schema="dbo", 
+                  if_exists='replace',  # Replace the existing table if it exists
+                  index=False)
+
+    end = time.time()  # Record the end time
+    print_time(' Push all companies predictions', end - start)  # Print the time taken for the push
+
+
+def learn_model():
+    """Learn Model function for the model pipeline"""
+    # Initialize database connection
     engine = create_connection()
     words_columns = []
+    
     print('load data')
+    # Load and prepare data
     df = load_data(engine, version_model)
     if flag_words:
         df, words_columns = load_words(engine, version_model, df)
     df = fillter_data(sub_pop, engine, version_model, df)
-    df, numeric_list, remove_cols, le = encoding_data(df, words_columns)
-    df, numeric_list = transforamtion(engine, df, numeric_list, words_columns, remove_cols)
-    df = create_centers(df, numeric_list)
+    df, numeric_list, remove_cols, le = encoding_data(df, words_columns, [], False)
+    if flag_full:
+        df, numeric_list = transforamtion(engine, df, numeric_list, words_columns, remove_cols)
+        df_group_mean = create_centers(df, numeric_list)
+        df = calculate_distance(df, df_group_mean, numeric_list)
+    
     print('run model')
+    # Train and evaluate models
     folds = create_folds(df)
-    lv1_df_k_fold_results = run_model(df, remove_cols, 'lv1', folds_size, folds, {})
-    lv4_df_k_fold_results = run_model(df, remove_cols, 'lv4', folds_size, folds, lv1_df_k_fold_results)
+    lv1_df_k_fold_results = run_model(df, remove_cols, 'lv1', folds_size, folds, [], {})
+    lv4_df_k_fold_results = run_model(df, remove_cols, 'lv4', folds_size, folds, le, lv1_df_k_fold_results)
     del lv1_df_k_fold_results, df
+    
+    # Calculate feature importance if needed
     if not n_features:
         importance_features(lv4_df_k_fold_results, engine, version_model)
+    
     print('run inference')
+    # Generate and store final predictions and metrics
     final_df = infernce_final_df(lv4_df_k_fold_results, le, remove_cols)
     final_df, anaf_df = infernce(engine, version_model, prediction_table_name, final_df)
     infernce_kpis(engine, final_df, anaf_df)
+
+
+def predict_all():
+    """Predict on all companies function for the model pipeline"""
+    # Load models pkls
+    with open(f"metadata_lv4_{kpis_model_version}.pkl", "rb") as f:
+        df_k_fold_results = cloudpickle.load(f)
+
+    with open(f"metadata_lv1_{kpis_model_version}.pkl", "rb") as f:
+        df_k_fold_results_lv1 = cloudpickle.load(f)
+
+    # Initialize database connection
+    engine = create_connection()
+    words_columns = []
+    
+    print('load data')
+    # Load and prepare data
+    le = df_k_fold_results['le']
+    df = load_data(engine, version_model)
+    if flag_words:
+        df, words_columns = load_words(engine, version_model, df)
+    df = fillter_data(4, engine, version_model, df)
+    df, numeric_list, remove_cols, le = encoding_data(df, words_columns, le, True)
+    if flag_full:
+        df, numeric_list = transforamtion(engine, df, numeric_list, words_columns, remove_cols)
+        df_group_mean = pd.read_csv(f'centers_{kpis_model_version}.csv')
+        df = calculate_distance(df, df_group_mean, numeric_list)
+
+    print('inference')
+    # Inference on all companies
+    df = inference_on_all_companies(df, df_k_fold_results, df_k_fold_results_lv1, le, remove_cols)
+    push_table(engine, df)
+
+
+def main():
+    if flag_train:
+        print('TRAIN')
+        learn_model()
+    if flag_predict_all:
+        print("INFERENCE")
+        predict_all()
 
 
 if __name__ == '__main__':
